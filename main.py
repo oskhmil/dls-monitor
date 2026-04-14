@@ -5,13 +5,15 @@ import html
 import logging
 import os
 import sqlite3
+import time
 from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 
 import requests
 from bs4 import BeautifulSoup
-from openpyxl import Workbook, load_workbook
+from openpyxl import Workbook
+from openpyxl.styles import Font, Alignment, Border, Side
 
 URL = "https://pub-mex.dls.gov.ua/QLA/DocList.aspx"
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "20"))
@@ -65,7 +67,7 @@ def get_conn():
 def init_db():
     with closing(get_conn()) as conn:
         conn.executescript(
-            '''
+            """
             CREATE TABLE IF NOT EXISTS documents (
                 uid TEXT PRIMARY KEY,
                 doc_num TEXT NOT NULL,
@@ -81,7 +83,7 @@ def init_db():
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
-            '''
+            """
         )
         conn.commit()
 
@@ -95,11 +97,11 @@ def get_meta(key, default=""):
 def set_meta(key, value):
     with closing(get_conn()) as conn:
         conn.execute(
-            '''
+            """
             INSERT INTO app_meta(key, value)
             VALUES(?, ?)
             ON CONFLICT(key) DO UPDATE SET value = excluded.value
-            ''',
+            """,
             (key, value),
         )
         conn.commit()
@@ -134,6 +136,7 @@ def request_with_retry(session, method, url, **kwargs):
         except Exception as exc:
             last_error = exc
             logging.warning("HTTP %s %s failed (%s/3): %s", method, url, attempt, exc)
+            time.sleep(attempt * 2)
     raise last_error
 
 
@@ -298,6 +301,7 @@ def send_telegram(doc):
             logging.warning("Telegram error %s: %s", response.status_code, response.text[:300])
         except Exception as exc:
             logging.warning("Telegram failed (%s/3): %s", attempt, exc)
+        time.sleep(attempt * 2)
     return False
 
 
@@ -316,10 +320,10 @@ def insert_or_update_documents(documents, bootstrap_silent):
             telegram_sent_at = datetime.utcnow().isoformat(timespec="seconds") if bootstrap_silent else None
 
             conn.execute(
-                '''
+                """
                 INSERT INTO documents(uid, doc_num, doc_date, doc_type, drug_name, telegram_sent, telegram_sent_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
-                ''',
+                """,
                 (doc["uid"], doc["doc_num"], doc["doc_date"], doc["doc_type"], doc["drug_name"], telegram_sent, telegram_sent_at),
             )
             new_count += 1
@@ -328,12 +332,12 @@ def insert_or_update_documents(documents, bootstrap_silent):
     if not bootstrap_silent:
         with closing(get_conn()) as conn:
             unsent = conn.execute(
-                '''
+                """
                 SELECT uid, doc_num, doc_date, doc_type, drug_name
                 FROM documents
                 WHERE telegram_sent = 0
                 ORDER BY substr(doc_date, 7, 4) || '-' || substr(doc_date, 4, 2) || '-' || substr(doc_date, 1, 2), doc_num, drug_name
-                '''
+                """
             ).fetchall()
 
         for doc in unsent:
@@ -354,19 +358,41 @@ def export_excel():
     wb = Workbook()
     ws = wb.active
     ws.title = "Журнал ДЛС"
+
+    # Стилі
+    font = Font(name="Verdana", size=8)
+    header_font = Font(name="Verdana", size=8, bold=True)
+
+    align_center = Alignment(
+        horizontal="center",
+        vertical="center",
+        wrap_text=True
+    )
+
+    border = Border(
+        left=Side(style="thin"),
+        right=Side(style="thin"),
+        top=Side(style="thin"),
+        bottom=Side(style="thin")
+    )
+
+    # Шапка
     ws.append(JOURNAL_HEADERS)
     ws.append(["1", "2", "3", "4", "5", "6", "7", "8"])
 
-    for col, width in {"A": 8, "B": 36, "C": 22, "D": 70, "E": 38, "F": 32, "G": 30, "H": 22}.items():
-        ws.column_dimensions[col].width = width
+    # Ширина колонок
+    widths = [6, 30, 20, 60, 30, 30, 30, 20]
+    for i, w in enumerate(widths, start=1):
+        ws.column_dimensions[chr(64 + i)].width = w
 
+    # Дані
     with closing(get_conn()) as conn:
         rows = conn.execute(
-            '''
+            """
             SELECT doc_num, doc_date, drug_name
             FROM documents
-            ORDER BY substr(doc_date, 7, 4) || '-' || substr(doc_date, 4, 2) || '-' || substr(doc_date, 1, 2), doc_num, drug_name
-            '''
+            ORDER BY substr(doc_date, 7, 4) || '-' || substr(doc_date, 4, 2) || '-' || substr(doc_date, 1, 2), doc_num
+            """
         ).fetchall()
 
     for index, row in enumerate(rows, start=1):
@@ -380,6 +406,17 @@ def export_excel():
             "",
             "",
         ])
+
+    # Форматування всіх клітинок
+    for row in ws.iter_rows(min_row=1, max_row=ws.max_row, max_col=8):
+        for cell in row:
+            cell.font = header_font if cell.row == 1 else font
+            cell.alignment = align_center
+            cell.border = border
+
+    # Висота рядків
+    for row_idx in range(1, ws.max_row + 1):
+        ws.row_dimensions[row_idx].height = 40
 
     wb.save(XLSX_PATH)
 
@@ -399,6 +436,8 @@ def main():
     print(f"documents_found={len(documents)}")
     print(f"new_documents={new_documents}")
     print(f"telegram_sent={telegram_sent_count}")
+    print(f"db_path={DB_PATH}")
+    print(f"xlsx_path={XLSX_PATH}")
 
 
 if __name__ == "__main__":
