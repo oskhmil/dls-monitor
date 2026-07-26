@@ -12,6 +12,9 @@ from pathlib import Path
 
 import requests
 from bs4 import BeautifulSoup
+
+import dlscore
+import stock as stockmod
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, Border, Side
 
@@ -25,6 +28,7 @@ DATA_DIR = Path("data")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "dls_monitor.db"
 XLSX_PATH = DATA_DIR / "Журнал_ДЛС.xlsx"
+JSON_PATH = DATA_DIR / "dls.json"
 
 INITIAL_BOOTSTRAP_SILENT = os.environ.get("INITIAL_BOOTSTRAP_SILENT", "true").strip().lower() == "true"
 
@@ -85,6 +89,17 @@ def init_db():
             );
             """
         )
+        # ── Міграція: окремі поля серії та виробника ──────────────────────
+        # drug_name склеює назву+серію+виробника і потрібен незмінним, бо
+        # з нього будується uid. Ламати uid не можна — бот перешле в Telegram
+        # усі 296 записів наново. Тому лише ДОДАЄМО колонки.
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(documents)")}
+        for col, decl in (
+            ("series_raw", "TEXT"),
+            ("manufacturer", "TEXT"),
+        ):
+            if col not in existing:
+                conn.execute(f"ALTER TABLE documents ADD COLUMN {col} {decl}")
         conn.commit()
 
 
@@ -205,6 +220,10 @@ def parse_grid_rows(grid, current_month, current_year):
             "doc_date": doc_date,
             "doc_type": parsed["doc_type"],
             "drug_name": drug_full,
+            # Чисті поля прямо з колонок сайту — саме вони йдуть у dls.json.
+            # Розбір склеєного рядка потрібен лише для старих записів.
+            "series_raw": series or "",
+            "manufacturer": parsed["manufacturer"] or "",
         })
     return records, hit_previous_month
 
@@ -271,7 +290,7 @@ def get_all_documents():
     return list(unique.values())
 
 
-def send_telegram(doc):
+def send_telegram(doc, stock_block=""):
     if not telegram_enabled():
         logging.warning("Telegram secrets not configured")
         return False
@@ -282,6 +301,7 @@ def send_telegram(doc):
         f"<b>Дата:</b> {html.escape(doc['doc_date'])}\n"
         f"<b>Захід:</b> {html.escape(doc['doc_type'])}\n"
         f"<b>Ліки:</b> {html.escape(doc['drug_name'])}"
+        + stock_block
     )
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -308,12 +328,23 @@ def send_telegram(doc):
 def insert_or_update_documents(documents, bootstrap_silent):
     new_count = 0
     telegram_sent_count = 0
+    stock_alert_count = 0
 
     with closing(get_conn()) as conn:
         for doc in documents:
             existing = conn.execute("SELECT uid FROM documents WHERE uid = ?", (doc["uid"],)).fetchone()
             if existing:
-                conn.execute("UPDATE documents SET source_seen_at = CURRENT_TIMESTAMP WHERE uid = ?", (doc["uid"],))
+                # Доливаємо чисті поля і в старі рядки, де їх ще немає
+                conn.execute(
+                    """
+                    UPDATE documents
+                       SET source_seen_at = CURRENT_TIMESTAMP,
+                           series_raw   = COALESCE(NULLIF(?, ''), series_raw),
+                           manufacturer = COALESCE(NULLIF(?, ''), manufacturer)
+                     WHERE uid = ?
+                    """,
+                    (doc.get("series_raw") or "", doc.get("manufacturer") or "", doc["uid"]),
+                )
                 continue
 
             telegram_sent = 1 if bootstrap_silent else 0
@@ -321,10 +352,12 @@ def insert_or_update_documents(documents, bootstrap_silent):
 
             conn.execute(
                 """
-                INSERT INTO documents(uid, doc_num, doc_date, doc_type, drug_name, telegram_sent, telegram_sent_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO documents(uid, doc_num, doc_date, doc_type, drug_name,
+                                      series_raw, manufacturer, telegram_sent, telegram_sent_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (doc["uid"], doc["doc_num"], doc["doc_date"], doc["doc_type"], doc["drug_name"], telegram_sent, telegram_sent_at),
+                (doc["uid"], doc["doc_num"], doc["doc_date"], doc["doc_type"], doc["drug_name"],
+                 doc.get("series_raw"), doc.get("manufacturer"), telegram_sent, telegram_sent_at),
             )
             new_count += 1
         conn.commit()
@@ -333,16 +366,37 @@ def insert_or_update_documents(documents, bootstrap_silent):
         with closing(get_conn()) as conn:
             unsent = conn.execute(
                 """
-                SELECT uid, doc_num, doc_date, doc_type, drug_name
+                SELECT uid, doc_num, doc_date, doc_type, drug_name, series_raw, manufacturer
                 FROM documents
                 WHERE telegram_sent = 0
                 ORDER BY substr(doc_date, 7, 4) || '-' || substr(doc_date, 4, 2) || '-' || substr(doc_date, 1, 2), doc_num, drug_name
                 """
             ).fetchall()
 
+        # Залишки тягнемо один раз і лише якщо є що розсилати. Якщо Google Drive
+        # недоступний — stock_items = None, повідомлення все одно піде, просто
+        # без блоку про склад. Втратити алерт через збій Drive неприпустимо.
+        stock_items = stockmod.fetch_stock() if unsent else None
+        stock_index = stockmod.build_index(stock_items) if stock_items else {}
+
         for doc in unsent:
             doc = dict(doc)
-            if send_telegram(doc):
+            try:
+                rec = dlscore.build_record(
+                    doc["uid"], doc["doc_num"], doc["doc_date"], doc["doc_type"],
+                    doc["drug_name"],
+                    series_raw=doc.get("series_raw") or None,
+                    manufacturer=doc.get("manufacturer") or None,
+                )
+                hits = stockmod.find_hits(rec, stock_items, stock_index)
+                stock_block = stockmod.format_hits(hits)
+                if hits:
+                    stock_alert_count += 1
+            except Exception as exc:
+                logging.warning("Звірка із залишками не вдалась для %s: %s", doc["doc_num"], exc)
+                stock_block = ""
+
+            if send_telegram(doc, stock_block):
                 with closing(get_conn()) as conn:
                     conn.execute(
                         "UPDATE documents SET telegram_sent = 1, telegram_sent_at = ? WHERE uid = ?",
@@ -351,72 +405,124 @@ def insert_or_update_documents(documents, bootstrap_silent):
                     conn.commit()
                 telegram_sent_count += 1
 
-    return new_count, telegram_sent_count
+    return new_count, telegram_sent_count, stock_alert_count
 
 
-def export_excel():
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Журнал ДЛС"
+MONTHS_UA = [
+    "Січень", "Лютий", "Березень", "Квітень", "Травень", "Червень",
+    "Липень", "Серпень", "Вересень", "Жовтень", "Листопад", "Грудень",
+]
 
-    # Стилі
-    font = Font(name="Verdana", size=8)
-    header_font = Font(name="Verdana", size=8, bold=True)
 
-    align_center = Alignment(
-        horizontal="center",
-        vertical="center",
-        wrap_text=True
-    )
+def month_title(ym):
+    """'2026-04' → 'Квітень 2026'"""
+    try:
+        y, m = ym.split("-")
+        return f"{MONTHS_UA[int(m) - 1]} {y}"
+    except Exception:
+        return ym
 
-    border = Border(
-        left=Side(style="thin"),
-        right=Side(style="thin"),
-        top=Side(style="thin"),
-        bottom=Side(style="thin")
-    )
 
-    # Шапка
-    ws.append(JOURNAL_HEADERS)
-    ws.append(["1", "2", "3", "4", "5", "6", "7", "8"])
-
-    # Ширина колонок
-    widths = [6, 30, 20, 60, 30, 30, 30, 20]
-    for i, w in enumerate(widths, start=1):
-        ws.column_dimensions[chr(64 + i)].width = w
-
-    # Дані
+def load_records():
+    """Читає БД і будує нормалізовані записи з обчисленим актуальним статусом."""
     with closing(get_conn()) as conn:
         rows = conn.execute(
-            """
-            SELECT doc_num, doc_date, drug_name
-            FROM documents
-            ORDER BY substr(doc_date, 7, 4) || '-' || substr(doc_date, 4, 2) || '-' || substr(doc_date, 1, 2), doc_num
-            """
+            "SELECT uid, doc_num, doc_date, doc_type, drug_name, series_raw, manufacturer FROM documents"
         ).fetchall()
 
-    for index, row in enumerate(rows, start=1):
-        ws.append([
-            index,
-            f"№ {row['doc_num']} від {row['doc_date']}",
-            row["doc_date"],
-            row["drug_name"],
-            "відсутній",
-            "",
-            "",
-            "",
-        ])
+    records = []
+    for r in rows:
+        r = dict(r)
+        records.append(
+            dlscore.build_record(
+                r["uid"], r["doc_num"], r["doc_date"], r["doc_type"], r["drug_name"],
+                series_raw=r.get("series_raw") or None,
+                manufacturer=r.get("manufacturer") or None,
+            )
+        )
+    return dlscore.compute_status(records)
 
-    # Форматування всіх клітинок
-    for row in ws.iter_rows(min_row=1, max_row=ws.max_row, max_col=8):
-        for cell in row:
-            cell.font = header_font if cell.row == 1 else font
-            cell.alignment = align_center
-            cell.border = border
 
-    # Висота рядків
-    for row_idx in range(1, ws.max_row + 1):
-        ws.row_dimensions[row_idx].height = 40
+def export_json():
+    """
+    data/dls.json — те, що читає Liki.on!.
+    Віддається через raw.githubusercontent.com (CORS: *), тож фронт бере
+    його напряму, без проксі й без Pages.
+    """
+    records = load_records()
+    payload = dlscore.build_payload(
+        records, datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    )
+    JSON_PATH.write_text(dlscore.dumps(payload), encoding="utf-8")
+    return payload
+
+
+def export_excel(records=None):
+    """
+    Журнал ДЛС: окремий аркуш на кожен місяць, нумерація з початку місяця,
+    лише чинні заборони (скасовані не потрапляють).
+
+    Колонка 5 тут завжди «відсутній» — цей файл не знає про залишки складів.
+    Заповнену версію генерує Liki.on! у браузері, де залишки вже є.
+    """
+    if records is None:
+        records = load_records()
+
+    active = [r for r in records if r["active"]]
+
+    by_month = {}
+    for r in active:
+        by_month.setdefault(r["ym"], []).append(r)
+
+    font = Font(name="Verdana", size=8)
+    header_font = Font(name="Verdana", size=8, bold=True)
+    align_center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    border = Border(
+        left=Side(style="thin"), right=Side(style="thin"),
+        top=Side(style="thin"), bottom=Side(style="thin"),
+    )
+    widths = [6, 30, 20, 60, 30, 30, 30, 20]
+
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    for ym in sorted(by_month.keys()):
+        ws = wb.create_sheet(title=month_title(ym)[:31])
+        ws.append(JOURNAL_HEADERS)
+        ws.append(["1", "2", "3", "4", "5", "6", "7", "8"])
+
+        for i, w in enumerate(widths, start=1):
+            ws.column_dimensions[chr(64 + i)].width = w
+
+        rows = sorted(by_month[ym], key=lambda r: (r["date"][6:], r["date"][3:5], r["date"][:2], r["num"]))
+        for index, r in enumerate(rows, start=1):
+            full = r.get("full") or ", ".join(
+                x for x in [
+                    r["name"],
+                    ("Серія № всі серії" if r["all_series"] else
+                     ("Серія № " + ", ".join(r["series"]) if r["series"] else "")),
+                    r.get("manufacturer") or "",
+                ] if x
+            )
+            ws.append([
+                index,
+                f"№ {r['num']} від {r['date']}",
+                r["date"],
+                full,
+                "відсутній",
+                "", "", "",
+            ])
+
+        for row in ws.iter_rows(min_row=1, max_row=ws.max_row, max_col=8):
+            for cell in row:
+                cell.font = header_font if cell.row == 1 else font
+                cell.alignment = align_center
+                cell.border = border
+        for row_idx in range(1, ws.max_row + 1):
+            ws.row_dimensions[row_idx].height = 40
+
+    if not wb.sheetnames:
+        wb.create_sheet(title="Журнал ДЛС")
 
     wb.save(XLSX_PATH)
 
@@ -427,8 +533,11 @@ def main():
     bootstrap_done = get_meta("bootstrap_done", "false").lower() == "true"
     bootstrap_silent = (not bootstrap_done) and INITIAL_BOOTSTRAP_SILENT
 
-    new_documents, telegram_sent_count = insert_or_update_documents(documents, bootstrap_silent)
-    export_excel()
+    new_documents, telegram_sent_count, stock_alerts = insert_or_update_documents(documents, bootstrap_silent)
+
+    records = load_records()
+    payload = export_json()
+    export_excel(records)
 
     if not bootstrap_done:
         set_meta("bootstrap_done", "true")
@@ -436,8 +545,12 @@ def main():
     print(f"documents_found={len(documents)}")
     print(f"new_documents={new_documents}")
     print(f"telegram_sent={telegram_sent_count}")
+    print(f"stock_alerts={stock_alerts}")
     print(f"db_path={DB_PATH}")
     print(f"xlsx_path={XLSX_PATH}")
+    print(f"json_path={JSON_PATH}")
+    print(f"active_bans={payload['active_bans']}")
+    print(f"parse_failures={sum(1 for r in payload['records'] if not r['parse_ok'])}")
 
 
 if __name__ == "__main__":
